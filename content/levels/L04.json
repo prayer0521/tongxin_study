@@ -1,0 +1,160 @@
+{
+ "id": "L04",
+ "title": "一个进程,一万个连接",
+ "subtitle": "C10K 的解法演化史就是半部服务器架构史。理解 epoll,就理解了 nginx/Redis/Node 的心脏。",
+ "blocks": [
+  {
+   "t": "hook",
+   "tag": "场景",
+   "text": "你的 `tcp_server` 是单线程串行的:必须等当前客户端断开,才能服务下一个。实验三里你已经看到,第 4 个客户端就开始在 backlog 队列里排队了。\n\n真实服务器要同时伺候成千上万人。「一个进程怎么同时处理一万个连接」—— 这就是著名的 **C10K 问题**。它的解法演化史,就是半部服务器架构史。"
+  },
+  {
+   "t": "h",
+   "text": "四代解法,一张图看懂差别"
+  },
+  {
+   "t": "fig",
+   "fig": "concurrency",
+   "cap": "同样 6 个请求(每个含 IO 等待),四种模型的耗时对比"
+  },
+  {
+   "t": "p",
+   "text": "看图:串行是一条长龙,总耗时是所有请求之和。而 epoll 单线程却能让请求几乎同时推进 —— **因为大部分时间连接是在等 IO(等网络、等数据库),这段等待时间被复用了。**这是理解现代服务器的钥匙。"
+  },
+  {
+   "t": "table",
+   "head": [
+    "模型",
+    "怎么做",
+    "问题",
+    "谁用"
+   ],
+   "rows": [
+    [
+     "串行",
+     "accept 一个,处理完,再 accept 下一个",
+     "一次只能一个人,其余排队",
+     "你的教学版 / 极简场景"
+    ],
+    [
+     "**每连接一进程** fork",
+     "来一个连接 fork 一个子进程",
+     "进程开销大,几百个就吃不消",
+     "早期 Apache (prefork)"
+    ],
+    [
+     "**每连接一线程**",
+     "来一个连接开一个线程",
+     "线程比进程轻,但上万个线程调度就崩了",
+     "传统 Java(Tomcat BIO)"
+    ],
+    [
+     "**epoll 事件循环**",
+     "单线程用 epoll 同时盯着所有 fd,谁就绪处理谁",
+     "编程模型复杂,一个阻塞调用毁所有",
+     "nginx、Redis、Node.js"
+    ]
+   ]
+  },
+  {
+   "t": "note",
+   "kind": "key",
+   "body": "**C10K 的难点从来不是「开一万个连接」,而是「一个线程怎么知道这一万个里哪个有数据了」。**\n\n- `select`/`poll` 的做法:每次都把一万个 fd 全问一遍「你好了吗」—— O(n),连接越多越慢。\n- `epoll` 的做法:内核维护一个就绪列表,**只把好了的 fd 告诉你** —— O(就绪数),和总连接数无关。\n\n这就是 nginx 能用几个进程扛几十万连接,而传统一连接一线程的服务器几千就崩的根本区别。",
+   "title": "epoll 到底赢在哪"
+  },
+  {
+   "t": "lab",
+   "id": "backlog",
+   "title": "重现连接在队列里排队",
+   "intro": "跑一个 backlog=2、而且**永不 accept** 的服务器,然后连 5 个客户端进去。你会看到前几个 connect 成功、后面的卡住 —— 亲眼看到那个「握完手却没人服务」的队列。",
+   "xp": 20,
+   "script": "l04_backlog",
+   "ask": "服务器一次 accept 都不调,客户端的 connect 会成功吗?",
+   "expect": "listen(backlog=2) 完成,故意不 accept,睡 30 秒\n第 1 个客户端: connect成功=1\n第 2 个客户端: connect成功=1\n第 3 个客户端: connect成功=1\n第 4 个客户端: connect成功=0     <- 卡住\n第 5 个客户端: connect成功=0     <- 卡住\n\nState   Recv-Q  Send-Q  Local Address:Port\nLISTEN  3       2       0.0.0.0:*",
+   "explain": "服务器**一次 accept 都没调**,前 3 个客户端的 `connect()` 却成功了 —— **这证明三次握手是内核自动完成的,和你的 accept 无关。** accept 只是「从内核已握完手的队列里取一个出来」。\n\n`ss` 里那两个数字很重要:\n- `Recv-Q = 3`:全连接队列里当前**堆积**了 3 个等着被 accept 的连接。\n- `Send-Q = 2`:这个队列的**上限**(就是 backlog)。\n\n**线上告警:`Recv-Q` 持续接近 `Send-Q`,就是「accept 不过来 / 服务过载」的信号。**(backlog=2 却进了 3,是 Linux `backlog+1` 的实现细节,别依赖精确值。)"
+  },
+  {
+   "t": "h",
+   "text": "为什么「一个阻塞调用毁所有」"
+  },
+  {
+   "t": "p",
+   "text": "事件循环的致命弱点:因为**一个线程管所有连接**,只要你在处理某个连接时调用了一个**阻塞**的操作(比如同步读文件、同步查数据库、`time.sleep`),整个循环就卡住了,其余上万个连接**全部**跟着饿死。"
+  },
+  {
+   "t": "poly",
+   "variants": {
+    "py": {
+     "code": "import asyncio\n\nasync def handle(reader, writer):\n    data = await reader.read(1024)\n    # ✗ 致命:同步阻塞调用,卡住整个事件循环\n    # result = requests.get('http://slow-api')   # 别这样!\n    # ✓ 正确:用异步版本,让出控制权\n    result = await async_http_get('http://slow-api')\n    writer.write(result)\n    await writer.drain()",
+     "file": "asyncio_trap.py",
+     "note": "Python asyncio 里混入一个同步阻塞调用,是最常见的性能事故。`async`/`await` 的本质就是「在等 IO 时主动让出线程」。"
+    },
+    "go": {
+     "code": "// Go 的杀手锏:你根本不用手写事件循环\nfor {\n    conn, _ := ln.Accept()\n    go handle(conn)      // 每连接一个 goroutine,就这一行\n}\n\nfunc handle(conn net.Conn) {\n    // 这里可以放心写「阻塞」代码:\n    result := http.Get(\"http://slow-api\")  // 看起来阻塞\n    // 但 Go runtime 会在它等 IO 时把这个 goroutine 挪开,\n    // 底层用 epoll 复用线程 —— 你写同步代码,拿到异步性能\n}",
+     "file": "goroutine.go",
+     "note": "**Go 最大的价值在这里**:你用最直觉的「一连接一 goroutine + 同步代码」写法,Go runtime 底层却用 epoll 事件循环 + 少量 OS 线程来跑。既没有回调地狱,又没有一线程一连接的开销。"
+    },
+    "cpp": {
+     "code": "// C/C++ 手写 epoll 事件循环的骨架\nint ep = epoll_create1(0);\nepoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);   // 把监听 fd 加进去\nfor (;;) {\n    int n = epoll_wait(ep, events, MAX, -1);  // 只返回就绪的\n    for (int i = 0; i < n; i++) {\n        if (events[i].data.fd == lfd) accept_new(ep);\n        else handle_ready(events[i].data.fd);  // 绝不能阻塞!\n    }\n}",
+     "file": "epoll_loop.c",
+     "note": "这就是 nginx / Redis 主循环的骨架。`epoll_wait` 只返回就绪的 fd,是整个高性能的核心。代价:handle 里任何阻塞调用都会卡死全场。"
+    }
+   },
+   "title": "同一个陷阱,在事件循环模型里"
+  },
+  {
+   "t": "note",
+   "kind": "biz",
+   "body": "选型不是「哪个最先进用哪个」,而是看**你的活儿是 CPU 密集还是 IO 密集**:\n\n- **IO 密集**(绝大多数 Web 后端:大部分时间在等数据库、等下游接口)→ 事件循环 / 协程最划算,少量线程扛海量连接。nginx、Node、Go、Redis 都是这条路。\n- **CPU 密集**(视频编码、大量计算)→ 事件循环没优势,反而要**多进程 / 多线程**把多核吃满。\n\n**实际生产常常是组合**:nginx(epoll)在前面扛连接,后面接一堆多进程 / 多线程的worker 干活。你后面几关搭的就是这个结构。",
+   "title": "怎么选:先问 CPU 密集还是 IO 密集"
+  }
+ ],
+ "boss": [
+  {
+   "q": "服务器一次 `accept` 都不调用,客户端 `connect` 却成功了。这说明?",
+   "opts": [
+    "客户端在骗人,其实没连上",
+    "三次握手由内核自动完成,accept 只是从已完成队列里取连接,不参与握手",
+    "这是操作系统的 bug",
+    "connect 有重试机制"
+   ],
+   "a": 1,
+   "why": "listen() 之后内核就自动替你握手,握完的连接放进全连接队列。accept 只是「取货」。所以不 accept,connect 照样成功,连接堆在队列里没人服务 —— 这正是 backlog 存在的意义。"
+  },
+  {
+   "q": "`epoll` 相比 `select` 在处理海量连接时的核心优势是?",
+   "opts": [
+    "epoll 用了更多线程",
+    "select 有 bug",
+    "select 每次要遍历全部 fd(O(n)),epoll 只返回就绪的 fd(与总连接数无关)",
+    "epoll 能突破文件描述符上限"
+   ],
+   "a": 2,
+   "why": "两者都是单线程管多 fd,区别在效率:select/poll 每次调用都要把所有 fd 检查一遍,连接越多越慢;epoll 靠内核就绪列表,只把有事件的 fd 交给你。这是 C10K 的关键。"
+  },
+  {
+   "q": "一个用 asyncio / 事件循环写的服务,你在某个请求处理里加了一句同步的 `time.sleep(2)`。后果?",
+   "opts": [
+    "只有这个请求慢 2 秒,其他不受影响",
+    "整个事件循环被卡住 2 秒,期间所有连接都得不到处理",
+    "asyncio 会自动把它转成异步",
+    "会开一个新线程去 sleep"
+   ],
+   "a": 1,
+   "why": "事件循环是单线程的。一个同步阻塞调用会霸占这个唯一的线程,导致期间所有连接饿死。这是事件循环模型最致命也最常犯的错。必须用 await asyncio.sleep 之类的异步版本。"
+  },
+  {
+   "q": "一个典型的 IO 密集型 Web 后端(大量时间在等数据库),最合适的并发模型是?",
+   "opts": [
+    "每连接一进程 fork",
+    "串行处理保证顺序",
+    "事件循环 / 协程(如 Go goroutine、Node、asyncio)",
+    "每个请求开 100 个线程"
+   ],
+   "a": 2,
+   "why": "IO 密集意味着线程大部分时间在等,这段等待可以被复用去处理别的连接。事件循环/协程正是干这个的,能用极少线程扛海量并发连接。CPU 密集才需要靠多进程吃满多核。"
+  }
+ ],
+ "bossTitle": "通关测试:并发模型",
+ "unlocks": "- **应用 #1** 节点点亮 —— 你的服务器现在能同时服务很多连接了。\n- 第一幕完成:你已经掌握了字节如何可靠地在两台机器间流动。"
+}

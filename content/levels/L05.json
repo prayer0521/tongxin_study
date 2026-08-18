@@ -1,0 +1,240 @@
+{
+ "id": "L05",
+ "title": "HTTP 就是一段有格式的字节",
+ "subtitle": "头用分隔符分帧,体用长度前缀 —— L03 的两招都在这儿。手打一个请求,再从零写个服务器。",
+ "blocks": [
+  {
+   "t": "hook",
+   "tag": "场景",
+   "text": "在 L03 你自己发明了一个长度前缀协议。现在看全世界都同意的那一个。\n\n你每天写 `fetch()`、每天调后端接口,但可能从没见过 HTTP 的**原始字节**。这一关的目标很具体:让你能**用手打出一个 HTTP 请求**,并且看着响应字节说出「哦,原来 `Content-Length` 是干这个的」。"
+  },
+  {
+   "t": "h",
+   "text": "HTTP 请求就是这几行文本"
+  },
+  {
+   "t": "p",
+   "text": "HTTP/1.1 是**纯文本**协议。一个请求的原始字节长这样(`↵` 表示 `\\r\\n`):"
+  },
+  {
+   "t": "code",
+   "code": "GET /api/orders?page=2 HTTP/1.1↵\nHost: example.com↵\nUser-Agent: curl/7.81.0↵\nAccept: */*↵\n↵                          <- 空行:头结束了",
+   "lang": "http",
+   "label": "请求报文"
+  },
+  {
+   "t": "p",
+   "text": "就这样。**第一行**是「方法 + 路径 + 版本」,**接下来每行一个头**,然后一个**空行**表示头结束。如果有请求体(POST 的 JSON),就跟在空行后面。"
+  },
+  {
+   "t": "note",
+   "kind": "key",
+   "body": "注意那个**空行**。它就是 L03 里讲的**分隔符分帧**:`\\r\\n\\r\\n` 标记「头部到此结束」。\n\n而**请求体**的长度没法靠分隔符(体里可能包含任何字节),所以 HTTP 用了**长度前缀**:`Content-Length: 137`。\n\n**HTTP 把 L03 的两种分帧方式都用上了** —— 头用分隔符,体用长度前缀。所有协议都在这两招里打转。",
+   "title": "HTTP 怎么划边界"
+  },
+  {
+   "t": "lab",
+   "id": "raw-http",
+   "title": "用 nc 手打一个 HTTP 请求",
+   "intro": "不用浏览器、不用 curl,直接把上面那几行字节塞进 TCP 连接,看服务器回什么。这个实验会起一个本地 HTTP 服务器,然后用 `nc`(或 python socket)手动发原始请求。",
+   "xp": 20,
+   "script": "l05_raw_http",
+   "ask": "如果我只发第一行 `GET / HTTP/1.1` 就不发了,服务器会立刻回响应吗?",
+   "expect": "=== 手动发送的原始字节 ===\nGET /hello HTTP/1.1\\r\\n\nHost: 127.0.0.1\\r\\n\n\\r\\n\n\n=== 服务器返回的原始字节 ===\nHTTP/1.1 200 OK\\r\\n\nContent-Type: text/plain; charset=utf-8\\r\\n\nContent-Length: 25\\r\\n\n\\r\\n\nhello from raw http!",
+   "explain": "**服务器不会立刻回。** 它要等到收到 `\\r\\n\\r\\n`(空行)才知道「头发完了」,才开始处理。你只发第一行,服务器会一直等 —— 直到超时。\n\n这就是 L03 那个「循环读到边界为止」在 HTTP 里的具体形态。任何 HTTP 服务器的第一步都是:**循环 recv,直到缓冲区里出现 `\\r\\n\\r\\n`。**\n\n响应的结构和请求对称:状态行 + 头 + 空行 + 体。`Content-Length: 25` 告诉客户端「体是 25 字节,读够就停」—— 否则客户端不知道该读到哪儿。"
+  },
+  {
+   "t": "h",
+   "text": "三个必须搞懂的头"
+  },
+  {
+   "t": "table",
+   "head": [
+    "头",
+    "解决什么问题",
+    "不用它会怎样"
+   ],
+   "rows": [
+    [
+     "`Content-Length`",
+     "告诉对方响应体有多少字节",
+     "对方不知道读到哪算完,只能等连接关闭"
+    ],
+    [
+     "`Transfer-Encoding: chunked`",
+     "响应体**边生成边发**,一开始不知道总长度",
+     "流式接口(如大文件、SSE、AI 逐字输出)没法做"
+    ],
+    [
+     "`Connection: keep-alive`",
+     "一条 TCP 连接上跑多个请求,**复用连接**",
+     "每个请求都要重新三次握手 + 慢启动(见 L02)"
+    ]
+   ]
+  },
+  {
+   "t": "note",
+   "kind": "biz",
+   "body": "**keep-alive 是 HTTP/1.1 最重要的性能优化**,直接对应 L02 学的东西:\n\n不用 keep-alive:每个请求 = 握手(1 RTT)+ 慢启动 + 传数据 + 四次挥手 + **服务端堆 TIME_WAIT**。\n用 keep-alive:握一次手,后面所有请求直接跑,连接一直是热的(拥塞窗口已经涨大了)。\n\n这就是为什么「接口本身很快但页面就是慢」常常是连接复用没配好 —— 浏览器和 nginx、nginx 和后端,**每一段都要单独配 keep-alive**。",
+   "title": "keep-alive 与 L02 的关系"
+  },
+  {
+   "t": "h",
+   "text": "从零写一个 HTTP 服务器"
+  },
+  {
+   "t": "p",
+   "text": "最好的理解方式是自己实现一遍。下面三个版本都做同一件事:接受连接 → 读到 `\\r\\n\\r\\n` → 解析请求行 → 拼一个响应。**注意这里没有任何框架,你能看到框架平时替你做的每一步。**"
+  },
+  {
+   "t": "poly",
+   "variants": {
+    "py": {
+     "code": "import socket\n\ndef handle(conn):\n    # 1. 循环读到头结束标记 —— 这就是 L03 的分隔符分帧\n    buf = b''\n    while b'\\r\\n\\r\\n' not in buf:\n        chunk = conn.recv(4096)\n        if not chunk:\n            return                      # 对端提前关闭\n        buf += chunk\n\n    # 2. 解析请求行:GET /path HTTP/1.1\n    head, _, rest = buf.partition(b'\\r\\n\\r\\n')\n    lines = head.split(b'\\r\\n')\n    method, path, version = lines[0].split()\n    headers = dict(\n        l.split(b': ', 1) for l in lines[1:] if b': ' in l\n    )\n\n    # 3. 业务逻辑(就这一行是你的业务)\n    body = f'你请求了 {path.decode()}'.encode()\n\n    # 4. 手拼响应:状态行 + 头 + 空行 + 体\n    resp = (\n        b'HTTP/1.1 200 OK\\r\\n'\n        b'Content-Type: text/plain; charset=utf-8\\r\\n'\n        b'Content-Length: ' + str(len(body)).encode() + b'\\r\\n'\n        b'Connection: close\\r\\n'\n        b'\\r\\n' + body\n    )\n    conn.sendall(resp)\n\nsrv = socket.socket()\nsrv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\nsrv.bind(('127.0.0.1', 8080))    # 只绑回环:没有认证的服务别对外\nsrv.listen(128)\nwhile True:\n    conn, addr = srv.accept()\n    with conn:\n        handle(conn)",
+     "file": "mini_http.py",
+     "note": "**Flask / Django 就是在这个基础上加了路由表、模板、ORM。** 而 `Content-Length` 要你自己算对 —— 算错了浏览器会一直转圈等剩下的字节。"
+    },
+    "go": {
+     "code": "package main\n\nimport (\"bufio\"; \"fmt\"; \"net\"; \"strings\")\n\nfunc handle(c net.Conn) {\n    defer c.Close()\n    r := bufio.NewReader(c)\n\n    // 1. 逐行读到空行 —— bufio 帮你处理了缓冲和分行\n    var reqLine string\n    for i := 0; ; i++ {\n        line, err := r.ReadString('\\n')\n        if err != nil { return }\n        if i == 0 { reqLine = strings.TrimSpace(line) }\n        if strings.TrimSpace(line) == \"\" { break }   // 头结束\n    }\n\n    // 2. 解析请求行\n    parts := strings.Fields(reqLine)\n    if len(parts) < 2 { return }\n    path := parts[1]\n\n    // 3+4. 业务 + 响应\n    body := fmt.Sprintf(\"你请求了 %s\", path)\n    fmt.Fprintf(c, \"HTTP/1.1 200 OK\\r\\n\"+\n        \"Content-Type: text/plain; charset=utf-8\\r\\n\"+\n        \"Content-Length: %d\\r\\n\\r\\n%s\", len(body), body)\n}\n\nfunc main() {\n    ln, _ := net.Listen(\"tcp\", \"127.0.0.1:8080\")\n    for {\n        c, err := ln.Accept()\n        if err != nil { continue }\n        go handle(c)          // 每连接一个 goroutine(见 L04)\n    }\n}",
+     "file": "mini_http.go",
+     "note": "注意 `go handle(c)` —— L04 讲的并发在这里只是一个关键字。生产里你会直接用 `net/http`,它内部就是这套 + 完整的协议处理。"
+    },
+    "cpp": {
+     "code": "// C 版:核心是那个「读到 \\r\\n\\r\\n」的循环\nvoid handle(int cfd) {\n    char buf[8192];\n    size_t got = 0;\n    /* 1. 循环读到头结束标记 */\n    while (got < sizeof(buf) - 1) {\n        ssize_t n = recv(cfd, buf + got, sizeof(buf) - 1 - got, 0);\n        if (n <= 0) return;\n        got += (size_t)n;\n        buf[got] = '\\0';\n        if (strstr(buf, \"\\r\\n\\r\\n\")) break;   /* 找到边界 */\n    }\n\n    /* 2. 解析请求行 */\n    char method[16] = {0}, path[512] = {0};\n    sscanf(buf, \"%15s %511s\", method, path);\n\n    /* 3+4. 业务 + 响应 */\n    char body[600];\n    int blen = snprintf(body, sizeof(body), \"你请求了 %s\", path);\n    char resp[1400];\n    int rlen = snprintf(resp, sizeof(resp),\n        \"HTTP/1.1 200 OK\\r\\n\"\n        \"Content-Type: text/plain; charset=utf-8\\r\\n\"\n        \"Content-Length: %d\\r\\n\"\n        \"Connection: close\\r\\n\\r\\n%s\", blen, body);\n    send_all(cfd, resp, (size_t)rlen);\n}",
+     "file": "mini_http.c",
+     "note": "你项目里已经有一个 `c/http_server.c` 了 —— 现在再读一遍,应该每一行都认识了。它和 nginx 的差别是「功能多少」,不是「原理不同」。"
+    }
+   },
+   "title": "最小 HTTP 服务器(能被浏览器访问)"
+  },
+  {
+   "t": "note",
+   "kind": "warn",
+   "body": "上面这个服务器**绑在 `127.0.0.1`,而且没有任何认证**。这是有意的:它是教学用的,只应该本机访问。\n\n如果你把 `bind` 改成 `0.0.0.0`,它就对整个局域网/公网开放了 —— 一个没有认证、没有输入长度校验、没有超时的服务器暴露在网上,会在几分钟内被扫到。**任何时候你写下 `0.0.0.0`,都要先问一句「认证在哪」。**",
+   "title": "把服务器暴露出去之前"
+  },
+  {
+   "t": "h",
+   "text": "状态码不是随便选的"
+  },
+  {
+   "t": "table",
+   "head": [
+    "码",
+    "语义",
+    "什么时候用",
+    "常见误用"
+   ],
+   "rows": [
+    [
+     "200",
+     "成功",
+     "正常返回",
+     "**业务失败也返 200** 然后在 body 里塞 `{\"code\":-1}` —— 让监控失效"
+    ],
+    [
+     "201",
+     "已创建",
+     "POST 成功创建了资源",
+     "创建成功却返 200"
+    ],
+    [
+     "400",
+     "客户端请求有毛病",
+     "参数缺失、格式错",
+     "用 500 表示参数错(会误报成服务故障)"
+    ],
+    [
+     "401",
+     "没认证",
+     "没登录 / token 无效",
+     "和 403 搞混"
+    ],
+    [
+     "403",
+     "认证了但没权限",
+     "登录了但不是管理员",
+     "和 401 搞混"
+    ],
+    [
+     "404",
+     "资源不存在",
+     "查一个不存在的 ID",
+     "把「无权限」也返 404(有时是**故意**的,防止探测)"
+    ],
+    [
+     "429",
+     "被限流了",
+     "触发速率限制",
+     "用 503(客户端不知道该退避重试)"
+    ],
+    [
+     "500",
+     "服务端自己炸了",
+     "未捕获异常",
+     "**什么错都返 500** —— 排查时无法区分"
+    ],
+    [
+     "502 / 504",
+     "网关拿不到 / 等超时了后端",
+     "nginx 后面的应用挂了 / 太慢",
+     "以为是 nginx 的问题(通常是后端)"
+    ]
+   ]
+  },
+  {
+   "t": "note",
+   "kind": "key",
+   "body": "**为什么状态码要用对:因为整条链路上所有基础设施都在读它。** 负载均衡靠 5xx 判断要不要摘掉这台机器;监控靠 5xx 率报警;客户端 SDK 靠 429/503 决定要不要退避重试;CDN 靠 2xx/3xx 决定缓存。\n\n**业务失败一律返 200 + body 里带错误码**,会让上面这些全部失效 —— 服务在疯狂报错,而你的监控面板一片绿。这是真实发生过无数次的事故。",
+   "title": "状态码是给机器看的"
+  }
+ ],
+ "boss": [
+  {
+   "q": "HTTP 服务器怎么知道「请求头读完了」?",
+   "opts": [
+    "读到固定的 1024 字节",
+    "读到连续的 \\r\\n\\r\\n(一个空行)",
+    "靠 Content-Length",
+    "等客户端关闭连接"
+   ],
+   "a": 1,
+   "why": "头部用**分隔符分帧**:空行(\\r\\n\\r\\n)标记头结束。而**请求体**才用 Content-Length(长度前缀)。这正是 L03 两种分帧方式的组合。"
+  },
+  {
+   "q": "一个接口业务上失败了(比如库存不足),返回 `HTTP 200` + `{\"code\":-1,\"msg\":\"库存不足\"}`。主要问题是?",
+   "opts": [
+    "浪费带宽",
+    "整条链路的基础设施(监控、负载均衡、重试逻辑)都靠状态码工作,200 会让它们认为一切正常",
+    "客户端无法解析",
+    "没有问题,这是最佳实践"
+   ],
+   "a": 1,
+   "why": "状态码是给机器看的。监控的 5xx 报警、LB 的健康判断、SDK 的重试退避全靠它。业务失败一律 200 会让这些机制集体失灵 —— 服务在报错而监控全绿。(注:库存不足这种『业务规则拒绝』用 4xx 更合适,如 409/422。)"
+  },
+  {
+   "q": "为什么 HTTP keep-alive 能显著提升性能?",
+   "opts": [
+    "它压缩了报文",
+    "它复用 TCP 连接,省掉了每次请求的三次握手和 TCP 慢启动过程",
+    "它让服务器少开线程",
+    "它绕过了 DNS 查询"
+   ],
+   "a": 1,
+   "why": "每建一条新 TCP 连接都要付 1 个 RTT 的握手,而且拥塞窗口从很小开始爬(慢启动)。复用热连接把这两笔开销都省了。这直接对应 L02 学的机制。"
+  },
+  {
+   "q": "`Transfer-Encoding: chunked` 主要解决什么?",
+   "opts": [
+    "加密传输",
+    "响应体边生成边发送,发送时还不知道总长度,所以无法给出 Content-Length",
+    "压缩响应体",
+    "支持断点续传"
+   ],
+   "a": 1,
+   "why": "当响应是流式生成的(大文件、SSE、AI 逐字输出),开始发的时候总长度未知,没法填 Content-Length。chunked 用「每块自带长度、以 0 长度块结尾」来分帧。"
+  }
+ ],
+ "bossTitle": "通关测试:HTTP 协议",
+ "unlocks": "- 你现在能看懂任何 HTTP 抓包了,这是后面所有关卡排查问题的基本工具。"
+}

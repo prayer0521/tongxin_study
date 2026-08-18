@@ -1,0 +1,225 @@
+{
+ "id": "L06",
+ "title": "一个请求的完整旅程",
+ "subtitle": "八个阶段,每段都会出故障。学会先定位「慢在哪一段」,再决定动哪里的代码。",
+ "blocks": [
+  {
+   "t": "hook",
+   "tag": "场景",
+   "text": "你说工作里就是「前后端互相请求」。这一关把那个「互相请求」彻底摊开:从你在地址栏敲回车,到页面出现,中间有**八个阶段**,每一个都可能出问题、都可能慢。\n\n为什么要背这条链路?因为线上排查的第一步永远是**定位在哪一段**。「接口慢」是个没用的描述;「DNS 200ms、TLS 握手 300ms、服务端 15ms」才是能动手的信息。"
+  },
+  {
+   "t": "h",
+   "text": "完整链路"
+  },
+  {
+   "t": "fig",
+   "fig": "requestpath",
+   "cap": "点播放:每一跳的耗时。注意「你的代码在跑」只占其中一小段"
+  },
+  {
+   "t": "p",
+   "text": "这张图最重要的信息是那句结论:**真正「你的业务代码在执行」的只有中间一小段**,其余都是网络和协议开销。所以当接口从 200ms 优化到 180ms 时,如果 DNS 花了 100ms,你优化的方向可能完全错了。"
+  },
+  {
+   "t": "h",
+   "text": "逐段拆:每一段的典型故障"
+  },
+  {
+   "t": "table",
+   "head": [
+    "阶段",
+    "干什么",
+    "典型故障",
+    "怎么确认"
+   ],
+   "rows": [
+    [
+     "**DNS**",
+     "域名 → IP,走 UDP:53",
+     "解析慢、解析到旧 IP(TTL 缓存)",
+     "`dig 域名` / `nslookup`,看 `Query time`"
+    ],
+    [
+     "**TCP 握手**",
+     "三次握手建连(1 RTT)",
+     "端口不通、防火墙、backlog 满(L04)",
+     "`telnet ip port` / `nc -vz ip port`"
+    ],
+    [
+     "**TLS 握手**",
+     "证书校验 + 密钥协商(1~2 RTT)",
+     "证书过期、域名不匹配、协议版本不兼容",
+     "`openssl s_client -connect host:443`"
+    ],
+    [
+     "**请求发出**",
+     "发 HTTP 报文",
+     "请求体太大、超时设置不合理",
+     "抓包 / 看客户端日志"
+    ],
+    [
+     "**LB 转发**",
+     "选一台后端",
+     "后端全挂 → 502;后端太慢 → 504",
+     "看 LB 的 access log 和状态码"
+    ],
+    [
+     "**应用处理**",
+     "你的代码 + 查 Redis/DB",
+     "慢查询、锁等待、GC",
+     "APM / 链路追踪(L14)"
+    ],
+    [
+     "**响应回传**",
+     "字节流回去",
+     "响应体过大、带宽瓶颈",
+     "看 `Content-Length` 和传输耗时"
+    ],
+    [
+     "**浏览器渲染**",
+     "解析 HTML/CSS/JS",
+     "阻塞脚本、大量重排",
+     "浏览器 DevTools Performance"
+    ]
+   ]
+  },
+  {
+   "t": "lab",
+   "id": "trace-req",
+   "title": "在本机量出每一段的真实耗时",
+   "intro": "用 `curl -w` 把一个请求的各阶段耗时打出来。这是**你以后排查线上接口慢最常用的一条命令**,值得记住。实验会请求本机的服务和一个外网站点做对比。",
+   "xp": 20,
+   "script": "l06_trace",
+   "ask": "请求本机 127.0.0.1 时,DNS 耗时会是多少?",
+   "expect": "=== 请求本机服务 (127.0.0.1) ===\n  DNS 解析      : 0.000012 s\n  TCP 握手完成  : 0.000271 s\n  TLS 握手完成  : 0.000000 s   (http 没有 TLS)\n  服务端首字节  : 0.000622 s\n  全部完成      : 0.000689 s\n\n=== 对比:请求外网 https 站点 ===\n  DNS 解析      : 0.004231 s\n  TCP 握手完成  : 0.031102 s\n  TLS 握手完成  : 0.093774 s   <- TLS 又花了一个多 RTT\n  服务端首字节  : 0.140217 s\n  全部完成      : 0.140905 s",
+   "explain": "**本机 DNS 几乎为 0**(127.0.0.1 不需要解析),TCP 握手也只有几百微秒 —— 因为走的是回环,没有真实网络。\n\n外网那组才是真实世界:`time_connect - time_namelookup` 是 TCP 握手,`time_appconnect - time_connect` 是 **TLS 握手**(通常是最大的一块固定开销),`time_starttransfer - time_appconnect` 才是**服务端真正处理的时间**。\n\n**记住这条命令:**\n`curl -w '@格式文件' -o /dev/null -s 'https://...'`\n\n下次「接口慢」的时候,先跑它。如果 `time_starttransfer` 很小而总时间很大,问题就不在后端代码 —— 别再去逐行读你的业务逻辑了。",
+   "needs": [
+    "curl"
+   ]
+  },
+  {
+   "t": "h",
+   "text": "为什么会突然多一个 OPTIONS 请求 —— CORS 预检"
+  },
+  {
+   "t": "p",
+   "text": "前端同学最常问后端的一句话:「我这个请求怎么发了两次?」以及「为什么 Postman 能通,浏览器就报 CORS 错?」"
+  },
+  {
+   "t": "note",
+   "kind": "key",
+   "body": "**同源策略是浏览器强加的,不是 HTTP 协议的一部分。** 这解释了为什么 Postman / curl 从来不报 CORS 错误 —— 它们不是浏览器,不执行这个策略。\n\n当前端发一个「非简单请求」(带 `Content-Type: application/json`、或者自定义头如 `Authorization`),浏览器会**先自动发一个 `OPTIONS` 请求**问服务器:「我能用 POST 带这些头请求你吗?」服务器必须回 `Access-Control-Allow-*` 头同意,浏览器才发真正的请求。\n\n所以「请求发了两次」是**正常的**:第一次是预检 OPTIONS,第二次才是真请求。",
+   "title": "CORS 预检是浏览器行为"
+  },
+  {
+   "t": "code",
+   "code": "# 浏览器自动发的预检\nOPTIONS /api/orders HTTP/1.1\nOrigin: http://localhost:3000\nAccess-Control-Request-Method: POST\nAccess-Control-Request-Headers: content-type,authorization\n\n# 服务器必须这样回,浏览器才放行\nHTTP/1.1 204 No Content\nAccess-Control-Allow-Origin: http://localhost:3000\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\nAccess-Control-Allow-Headers: content-type,authorization\nAccess-Control-Max-Age: 86400        # 预检结果缓存一天,避免每次都问",
+   "lang": "http",
+   "label": "CORS 预检往返"
+  },
+  {
+   "t": "note",
+   "kind": "warn",
+   "body": "`Access-Control-Allow-Origin: *` 很方便,但它和 `Allow-Credentials: true` **不能共存**(浏览器会拒绝),而且意味着**任何网站**都能读你的接口响应。\n\n如果接口需要带 Cookie 认证,必须**回显具体的 Origin**(而且要校验它在白名单里,不能无脑回显请求里的 Origin —— 那等于关掉了同源保护)。",
+   "title": "`*` 通配符的代价"
+  },
+  {
+   "t": "h",
+   "text": "幂等性:为什么 PUT 能重试,POST 不能"
+  },
+  {
+   "t": "p",
+   "text": "这不是 REST 教条,而是有实际后果的工程约束。理由在 L02:**网络会超时,而超时是三态的** —— 请求没到、请求到了但响应丢了、请求确实失败了。你分辨不出来。"
+  },
+  {
+   "t": "table",
+   "head": [
+    "方法",
+    "幂等?",
+    "含义",
+    "超时后能自动重试吗"
+   ],
+   "rows": [
+    [
+     "GET",
+     "是",
+     "读取,不改状态",
+     "**能**"
+    ],
+    [
+     "PUT",
+     "是",
+     "把资源设置成这个值(执行 N 次结果一样)",
+     "**能**"
+    ],
+    [
+     "DELETE",
+     "是",
+     "删掉它(删 N 次结果一样:不存在)",
+     "**能**"
+    ],
+    [
+     "POST",
+     "**否**",
+     "创建一个新的 / 触发一个动作",
+     "**不能** —— 可能创建两笔订单"
+    ]
+   ]
+  },
+  {
+   "t": "note",
+   "kind": "biz",
+   "body": "「用户点了一次支付,却扣了两次钱」的经典成因:客户端 POST 超时了,自动重试了一次,而**第一次其实已经成功了**,只是响应丢在回程路上。\n\n**标准解法:幂等键(idempotency key)。** 客户端生成一个唯一 ID 放在请求头里,服务端第一次处理时把这个 ID 记下来;重试带着同一个 ID 过来,服务端发现见过,**直接返回第一次的结果**,不再执行。Stripe、微信支付都是这么做的。\n\n这个问题在 L12(消息队列)和 L13(分布式)会再遇到两次 —— **幂等是分布式系统里绕不开的主题**,不是可选的优化。",
+   "title": "重复扣款是怎么发生的"
+  }
+ ],
+ "boss": [
+  {
+   "q": "接口总耗时 800ms。用 `curl -w` 量出 `time_starttransfer - time_appconnect = 20ms`。说明什么?",
+   "opts": [
+    "服务端代码有性能问题,要优化业务逻辑",
+    "服务端处理只花了 20ms,780ms 消耗在 DNS/TCP/TLS/传输等环节,该往网络侧查",
+    "curl 测不准",
+    "数据库有慢查询"
+   ],
+   "a": 1,
+   "why": "time_starttransfer 减 time_appconnect 就是「服务端从收到请求到吐出第一个字节」的时间。只有 20ms 说明后端很快,瓶颈在它之前的环节。这时去优化业务代码是白费力气。"
+  },
+  {
+   "q": "前端说「同一个请求浏览器发了两次,Postman 只发一次」。最可能的原因?",
+   "opts": [
+    "浏览器有 bug",
+    "前端代码写错了,调用了两次",
+    "浏览器对非简单跨域请求会先发 OPTIONS 预检,Postman 不是浏览器所以不执行同源策略",
+    "网络重传"
+   ],
+   "a": 2,
+   "why": "CORS 是浏览器强制的安全策略。带 JSON Content-Type 或自定义头的跨域请求会触发预检 OPTIONS。curl/Postman 不实现同源策略,所以看不到这个现象 —— 这也是为什么「Postman 能通浏览器报错」如此常见。"
+  },
+  {
+   "q": "为什么客户端可以对超时的 `PUT` 自动重试,但不该对 `POST` 自动重试?",
+   "opts": [
+    "PUT 比 POST 快",
+    "PUT 是幂等的(执行多次结果相同),POST 通常不幂等,重试可能重复创建资源",
+    "POST 请求体太大",
+    "HTTP 协议禁止重试 POST"
+   ],
+   "a": 1,
+   "why": "超时是三态的:你分不清「没到」「到了但响应丢了」「真失败了」。幂等操作重试无害,非幂等操作重试可能造成重复下单/重复扣款。解法是幂等键。"
+  },
+  {
+   "q": "你的服务需要支持带 Cookie 的跨域请求。下面哪种 CORS 配置是**错**的?",
+   "opts": [
+    "回显白名单内的具体 Origin,并设 Access-Control-Allow-Credentials: true",
+    "Access-Control-Allow-Origin: * 配合 Access-Control-Allow-Credentials: true",
+    "设置 Access-Control-Max-Age 缓存预检结果",
+    "在 Allow-Headers 里列出 authorization"
+   ],
+   "a": 1,
+   "why": "浏览器明确禁止 `*` 与 `Allow-Credentials: true` 共存 —— 那等于允许任意站点带着用户凭证读你的接口。必须回显经过白名单校验的具体 Origin。"
+  }
+ ],
+ "bossTitle": "通关测试:全链路",
+ "unlocks": "- **DNS** 节点点亮 —— 请求的真正第一步。\n- 你现在有了一条排查思路:任何「慢」和「报错」,先定位到链路的某一段。"
+}

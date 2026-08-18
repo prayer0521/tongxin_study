@@ -1,0 +1,251 @@
+{
+ "id": "L09",
+ "title": "无状态化:能横向扩展的前提",
+ "subtitle": "加机器能work的前提是任何机器都能处理任何请求。先把隐藏的本地状态全找出来。",
+ "blocks": [
+  {
+   "t": "hook",
+   "tag": "场景",
+   "text": "L08 你加上了第二台、第三台机器,nginx 也在正常分流。上线之后,客服开始收到投诉:\n\n> 「我刚登录进去,点两下就又让我登录了。再刷一下又好了。」\n\n你查日志,没有报错。你本地复现,一切正常。但用户就是**随机掉登录**。\n\n原因很简单:用户第一次请求落在**机器 A**,A 把 session 存在**自己的内存里**。第二次请求被 nginx 分给了**机器 B**,B 的内存里没有这个 session —— 在 B 看来,这是个没登录的陌生人。"
+  },
+  {
+   "t": "note",
+   "kind": "key",
+   "body": "**这一关是所有横向扩展的先决条件。** L08 加机器之所以能work,前提是「任何一台机器都能处理任何一个请求」。一旦某台机器上存了**只有它自己知道的东西**,这个前提就破了。\n\n「无状态」不是说服务不能有数据,而是说**状态不能存在单台机器的本地**。状态要挪到所有机器都能访问的地方(Redis、数据库),或者干脆**放在客户端手里**(JWT)。",
+   "title": "无状态到底指什么"
+  },
+  {
+   "t": "h",
+   "text": "先把「隐藏的本地状态」找出来"
+  },
+  {
+   "t": "p",
+   "text": "内存 session 只是最显眼的一个。下面这些同样会让你的服务无法横向扩展,而且更难发现 —— **对着这张表检查一遍你自己的项目**:"
+  },
+  {
+   "t": "table",
+   "head": [
+    "隐藏的本地状态",
+    "加机器后会怎样",
+    "该挪到哪"
+   ],
+   "rows": [
+    [
+     "内存里的 session / 登录态",
+     "**随机掉登录**",
+     "Redis 或 JWT"
+    ],
+    [
+     "进程内缓存(如全局 dict)",
+     "**各机器数据不一致**,改了一台另一台还是旧的",
+     "Redis(L10)"
+    ],
+    [
+     "上传的文件存本地磁盘",
+     "在 A 上传,请求到 B 就 **404**",
+     "对象存储 S3/OSS/MinIO"
+    ],
+    [
+     "本地日志文件",
+     "排查问题要**逐台登录去 grep**",
+     "集中日志(L14)"
+    ],
+    [
+     "定时任务写在应用里",
+     "**每台机器都跑一遍** —— 短信发 3 次、账单算 3 次",
+     "分布式调度 / 抢分布式锁(L13)"
+    ],
+    [
+     "自增计数器在内存里",
+     "**每台各数一份**,总数永远不对",
+     "Redis `INCR`"
+    ],
+    [
+     "WebSocket 长连接",
+     "消息只能推给**连在这台机器上**的用户",
+     "Redis 发布订阅 / 专门的推送网关"
+    ],
+    [
+     "本地内存限流计数",
+     "限流阈值实际被**放大 N 倍**(N=机器数)",
+     "Redis 计数(L14)"
+    ]
+   ]
+  },
+  {
+   "t": "note",
+   "kind": "biz",
+   "body": "**定时任务那一条是最容易翻车的**,因为它在测试环境(只有一台机器)永远正常。\n\n一上生产 3 台机器,「每天早 8 点给用户发账单短信」就变成**每个用户收到 3 条**。更糟的是「每小时扣一次费」变成扣三次。\n\n这类事故的特点是:**代码没错、测试通过、只在生产多机环境下爆发**,而且往往是用户投诉才发现。检查清单里必须有这一项。",
+   "title": "最容易翻车的一条"
+  },
+  {
+   "t": "h",
+   "text": "会话方案:三种做法,各有硬伤"
+  },
+  {
+   "t": "p",
+   "text": "既然内存 session 不行,业界的三个方案是:"
+  },
+  {
+   "t": "table",
+   "head": [
+    "方案",
+    "怎么做",
+    "优点",
+    "**硬伤**"
+   ],
+   "rows": [
+    [
+     "**粘性会话**<br>(sticky session)",
+     "LB 按 IP/Cookie 把同一用户**固定**分给同一台机器",
+     "改动最小,几乎不用改代码",
+     "**那台机器一挂,它上面所有用户全掉线**;而且流量无法均匀分布,发版重启就是一次全员掉线"
+    ],
+    [
+     "**集中式 session**",
+     "session 存 Redis,所有机器都去 Redis 读",
+     "**可以主动失效**(踢人下线、改密码全端登出);机器随便加减",
+     "每个请求多一次 Redis 往返;Redis 成为**关键依赖**,它挂了全站登录失效"
+    ],
+    [
+     "**JWT**(令牌)",
+     "把用户信息**签名后交给客户端**,服务端不存任何东西",
+     "**服务端完全无状态**;不用查 Redis,省一次往返;天然适合多端/微服务",
+     "**签发出去��无法主动失效** —— 用户改密码、管理员封号,旧 token 在过期前依然有效"
+    ]
+   ]
+  },
+  {
+   "t": "note",
+   "kind": "trap",
+   "body": "**JWT 无法主动失效,这是它最被低估的代价。** 很多人选 JWT 是因为「无状态、不用查 Redis」,但没想清楚这个后果:\n\n- 用户改了密码,旧 token 还能用。\n- 管理员封禁了账号,他还能继续操作到 token 过期。\n- token 泄露了,你**没办法撤销它**。\n\n常见的补救办法:\n1. **短过期 + refresh token**:access token 只活 5~15 分钟,refresh token 存服务端(可撤销)。这是主流做法。\n2. **黑名单**:把被撤销的 token ID 存进 Redis。但这样你又回去查 Redis 了 —— **JWT 的「无状态」优势就消失了大半**。\n\n**所以别把 JWT 当成默认选择。** 如果你的系统需要「立刻踢人下线」,集中式 session 反而更简单直接。",
+   "title": "JWT 的那个硬伤"
+  },
+  {
+   "t": "h",
+   "text": "三种语言:把 session 从内存挪到 Redis"
+  },
+  {
+   "t": "p",
+   "text": "改动本身很小。关键是看清**改之前**和**改之后**状态存在哪。"
+  },
+  {
+   "t": "poly",
+   "variants": {
+    "py": {
+     "code": "# ✗ 这份代码在单机上完美工作,加第二台机器就开始随机掉登录\nSESSIONS = {}          # <- 致命:这个 dict 只属于当前进程\n\ndef login(username, password):\n    if not check_password(username, password):\n        return None\n    sid = secrets.token_urlsafe(32)\n    SESSIONS[sid] = {'user': username, 'ts': time.time()}\n    return sid\n\ndef whoami(sid):\n    s = SESSIONS.get(sid)      # 机器 B 上这里永远是 None\n    return s['user'] if s else None",
+     "file": "session_bad.py",
+     "note": "`SESSIONS` 这个全局字典就是「隐藏的本地状态」最典型的样子。**它在单机测试里 100% 正常**,所以很容易一路带到生产。"
+    },
+    "go": {
+     "code": "// ✗ 同样的错误,Go 版\nvar sessions = struct {\n    sync.RWMutex\n    m map[string]Session\n}{m: make(map[string]Session)}    // <- 进程内,加机器就废\n\nfunc login(u, p string) (string, error) {\n    if !checkPassword(u, p) { return \"\", ErrAuth }\n    sid := randomToken(32)\n    sessions.Lock()\n    sessions.m[sid] = Session{User: u, TS: time.Now()}\n    sessions.Unlock()\n    return sid, nil\n}",
+     "file": "session_bad.go",
+     "note": "加了读写锁,**并发安全了,但依然是本地状态**。锁解决的是「同一进程内多线程」的问题,不解决「多台机器」的问题 —— 两件事别混。"
+    }
+   },
+   "title": "改造前(错):session 在进程内存里"
+  },
+  {
+   "t": "poly",
+   "variants": {
+    "py": {
+     "code": "import redis, secrets, json\n\n# 所有机器连同一个 Redis。这就是「集中式」的含义\nr = redis.Redis(host='127.0.0.1', port=16380, decode_responses=True)\n\nSESSION_TTL = 1800        # 30 分钟\n\ndef login(username, password):\n    if not check_password(username, password):\n        return None\n    sid = secrets.token_urlsafe(32)\n    # SETEX = 存值 + 设过期。过期由 Redis 负责,不用自己写清理任务\n    r.setex(f'sess:{sid}', SESSION_TTL,\n            json.dumps({'user': username}))\n    return sid\n\ndef whoami(sid):\n    raw = r.get(f'sess:{sid}')     # 任何一台机器都读得到\n    if not raw:\n        return None\n    # 滑动过期:每次访问都续期,模拟「活跃就不掉线」\n    r.expire(f'sess:{sid}', SESSION_TTL)\n    return json.loads(raw)['user']\n\ndef logout_everywhere(username):\n    \"\"\"集中式 session 的杀手级优势:能主动踢人。\n       JWT 做不到这件事。\"\"\"\n    for key in r.scan_iter('sess:*'):\n        raw = r.get(key)\n        if raw and json.loads(raw).get('user') == username:\n            r.delete(key)",
+     "file": "session_redis.py",
+     "note": "注意 `logout_everywhere` —— **这就是选集中式而不是 JWT 的理由**。改密码、封号、异地登录踢人,都靠它。(生产里别用 `scan_iter` 遍历全库,应该额外维护一个 `user:{name}:sessions` 集合。)"
+    },
+    "go": {
+     "code": "import (\"context\"; \"encoding/json\"; \"time\"\n        \"github.com/redis/go-redis/v9\")\n\nvar rdb = redis.NewClient(&redis.Options{\n    Addr: \"127.0.0.1:16380\",\n})\n\nconst sessionTTL = 30 * time.Minute\n\nfunc login(ctx context.Context, u, p string) (string, error) {\n    if !checkPassword(u, p) { return \"\", ErrAuth }\n    sid := randomToken(32)\n    b, _ := json.Marshal(Session{User: u})\n    // Set 的最后一个参数就是 TTL,等价于 SETEX\n    if err := rdb.Set(ctx, \"sess:\"+sid, b, sessionTTL).Err(); err != nil {\n        return \"\", err\n    }\n    return sid, nil\n}\n\nfunc whoami(ctx context.Context, sid string) (string, error) {\n    b, err := rdb.Get(ctx, \"sess:\"+sid).Bytes()\n    if err == redis.Nil { return \"\", ErrNoSession }\n    if err != nil       { return \"\", err }   // Redis 挂了要区分处理\n    rdb.Expire(ctx, \"sess:\"+sid, sessionTTL) // 滑动过期\n    var s Session\n    json.Unmarshal(b, &s)\n    return s.User, nil\n}",
+     "file": "session_redis.go",
+     "note": "注意 `err == redis.Nil`(没这个 key)和 `err != nil`(Redis 出故障)**必须分开处理**。混在一起的话,Redis 一抖动就变成「全站用户未登录」,而正确行为应该是返回 500 让客户端重试。"
+    }
+   },
+   "title": "改造后(对):session 存 Redis"
+  },
+  {
+   "t": "h",
+   "text": "真跑一遍:复现掉登录,再修好它"
+  },
+  {
+   "t": "lab",
+   "id": "stateless",
+   "title": "亲手复现「随机掉登录」,然后用 Redis 修掉",
+   "intro": "起 2 个后端 + nginx 轮询。**阶段 1** 用内存 session:登录一次,然后连续请求 6 次,你会看到大约一半的请求认不出你。**阶段 2** 换成 Redis session,同样打 6 次,全部正常。",
+   "xp": 30,
+   "script": "l09_stateless",
+   "ask": "内存 session 版,登录后连打 6 个请求,大概几个会失败?",
+   "expect": "=== 阶段 1:内存 session(2 台机器各存各的) ===\n  在某台机器上登录,拿到 sid=xnQ7...\n  用这个 sid 连打 6 次 /whoami:\n    第 1 次 -> app-1  ✓ alice\n    第 2 次 -> app-2  ✗ 未登录     <- 分到了另一台\n    第 3 次 -> app-1  ✓ alice\n    第 4 次 -> app-2  ✗ 未登录\n    第 5 次 -> app-1  ✓ alice\n    第 6 次 -> app-2  ✗ 未登录\n  成功 3 / 失败 3   <- 用户感受到的就是「随机掉登录」\n\n=== 阶段 2:Redis session(2 台机器共享) ===\n    第 1 次 -> app-1  ✓ alice\n    第 2 次 -> app-2  ✓ alice\n    第 3 次 -> app-1  ✓ alice\n    第 4 次 -> app-2  ✓ alice\n    第 5 次 -> app-1  ✓ alice\n    第 6 次 -> app-2  ✓ alice\n  成功 6 / 失败 0\n\n=== 阶段 3:主动踢人(JWT 做不到的事) ===\n  调用 logout_everywhere('alice') 后再请求:\n    第 1 次 -> app-2  ✗ 未登录   <- 立刻生效,两台都失效",
+   "explain": "**阶段 1 的失败率恰好是 (N-1)/N**(N = 机器台数)。两台机器 → 一半失败;三台 → 2/3 失败。这个规律能帮你从现象反推机器数。\n\n注意它**不是稳定失败**,而是交替 —— 这正是最难排查的一类 bug:重试一次就好了,日志里没有错误,本地(单机)永远复现不了。\n\n**阶段 3 是选型的关键论据。** `logout_everywhere` 一调用,两台机器上的会话**立刻**全部失效。如果用 JWT,你做不到这件事 —— token 已经在用户手里了,你无法收回,只能等它过期(或者引入黑名单,而黑名单又要查 Redis,JWT 的无状态优势就没了)。\n\n**这就是为什么「需要能踢人下线」的系统应该选集中式 session,而不是 JWT。**",
+   "needs": [
+    "docker"
+   ]
+  },
+  {
+   "t": "h",
+   "text": "检查清单:上线前问自己这几句"
+  },
+  {
+   "t": "p",
+   "text": "这张清单值得存下来。每次要给服务加机器之前走一遍:"
+  },
+  {
+   "t": "code",
+   "code": "□ 有没有全局变量 / 单例在存请求间要复用的数据?\n     (Python 的模块级 dict、Java 的 static Map、Go 的包级 var)\n\n□ session / 登录态存在哪?内存的话,加机器就会随机掉登录\n\n□ 有没有往本地磁盘写东西?上传的文件、生成的报表、导出的 Excel\n     -> 换对象存储。判据:换一台机器还读得到吗?\n\n□ 有没有定时任务写在应用进程里?\n     -> N 台机器会跑 N 遍。要抢分布式锁,或交给专门的调度器\n\n□ 有没有进程内缓存?加机器后各台数据会不一致\n     -> 能容忍短暂不一致就设短 TTL;不能就用 Redis\n\n□ 有没有内存里的计数器 / 限流器?\n     -> 实际阈值会被放大 N 倍\n\n□ WebSocket / SSE 长连接怎么处理?\n     -> 消息只能推给连在本机的用户,要用 Redis 订阅广播\n\n□ 重启一台机器,用户会有感知吗?\n     -> 有感知就说明还有本地状态没挪走",
+   "lang": "text",
+   "label": "横向扩展前的自检清单"
+  },
+  {
+   "t": "note",
+   "kind": "key",
+   "body": "**最实用的一句判据:「随机杀掉任意一台机器,用户能不能无感?」**\n\n如果答案是「会掉线 / 会丢数据 / 会重复执行」,那就还有本地状态没挪走。\n\n这也是云原生里 **Pod 可随时被杀** 的前提 —— Kubernetes 会毫不客气地重启、迁移你的容器。无状态是这一切的基础,不是可选的优化。",
+   "title": "一句话自检"
+  }
+ ],
+ "boss": [
+  {
+   "q": "加了第二台机器后用户开始随机掉登录,大约一半请求认不出登录态。根因是?",
+   "opts": [
+    "Redis 连接池太小",
+    "session 存在各机器的进程内存里,请求被 LB 分到另一台时读不到",
+    "nginx 配置错了",
+    "数据库主从延迟"
+   ],
+   "a": 1,
+   "why": "失败率恰好是 (N-1)/N,N 是机器数。两台机器 → 一半失败。这是内存 session 的典型指纹:不稳定失败、重试就好、单机永远复现不了。"
+  },
+  {
+   "q": "你的系统要求「管理员封禁账号后,该用户立刻无法操作」。会话方案该怎么选?",
+   "opts": [
+    "JWT,因为它无状态、性能好",
+    "集中式 session(Redis)——  能主动删除会话,立刻生效",
+    "粘性会话",
+    "都可以,没区别"
+   ],
+   "a": 1,
+   "why": "JWT 签发后无法主动失效,封号了旧 token 在过期前依然有效。要么选集中式 session,要么给 JWT 加黑名单 —— 但黑名单又要查 Redis,JWT 的无状态优势就没了。"
+  },
+  {
+   "q": "下面哪一项**不会**因为加机器而出问题?",
+   "opts": [
+    "「每天早 8 点发账单短信」的定时任务写在应用进程里",
+    "上传的头像保存到本地 ./uploads/ 目录",
+    "把用户信息查询结果写进 Redis 缓存",
+    "用进程内的 dict 做接口限流计数"
+   ],
+   "a": 2,
+   "why": "写 Redis 是**共享**存储,所有机器读到同一份,这正是正确做法。其余三项都是本地状态:定时任务会跑 N 遍(短信发 N 条)、本地文件在别的机器上 404、内存限流器让阈值放大 N 倍。"
+  },
+  {
+   "q": "「无状态服务」最准确的含义是?",
+   "opts": [
+    "服务不能保存任何数据",
+    "服务不能用数据库",
+    "状态不存在单台机器的本地,任何一台机器都能处理任何一个请求",
+    "服务必须用 JWT"
+   ],
+   "a": 2,
+   "why": "无状态不是「没有数据」,而是「数据不绑定在某台特定机器上」。状态挪到 Redis、数据库或客户端都行。判据是:随机杀掉任意一台机器,用户能否无感。"
+  }
+ ],
+ "bossTitle": "通关测试:无状态化",
+ "unlocks": "- **应用 #2 / #3** 真正可用了 —— 之前它们只是画在图上,现在能安全接流量。\n- 你的服务现在满足「随时杀掉任意一台,用户无感」,这是云原生的入场券。"
+}

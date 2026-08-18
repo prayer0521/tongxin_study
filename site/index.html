@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>通信网 → 现代后端 · 闯关</title>
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+<div id="boot" class="boot">正在加载关卡…</div>
+
+<div id="shell" class="shell" hidden>
+
+  <aside class="side">
+    <a class="brand" href="#/map">
+      <span class="brand-dot"></span>
+      <span>
+        <b>通信网 → 现代后端</b>
+        <em>从两台主机到分布式系统</em>
+      </span>
+    </a>
+
+    <div class="hud">
+      <div class="hud-top">
+        <span class="rank" id="hud-rank">见习</span>
+        <span class="xp" id="hud-xp">0 XP</span>
+      </div>
+      <div class="bar"><i id="hud-bar" style="width:0%"></i></div>
+      <div class="hud-sub" id="hud-sub">0 / 14 关</div>
+    </div>
+
+    <nav id="nav" class="nav"></nav>
+
+    <div class="side-foot">
+      <a href="#/arch">系统架构图</a>
+      <a href="#/skills">能力总览</a>
+      <button id="btn-reset" class="linkish" type="button">重置进度</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div id="crumb" class="crumb"></div>
+      <div class="langpick" id="langpick" role="group" aria-label="选择语言">
+        <button data-lang="cpp" type="button">C++</button>
+        <button data-lang="py" type="button">Python</button>
+        <button data-lang="go" type="button">Go</button>
+      </div>
+    </div>
+    <div id="view" class="view"></div>
+  </main>
+
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/js/md.js"></script>
+<script src="/js/store.js"></script>
+<script src="/js/diagrams.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
